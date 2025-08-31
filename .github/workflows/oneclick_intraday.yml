@@ -73,8 +73,7 @@ jobs:
 
           def feature_table(df):
               X = df.copy()
-              X["ret1"] = X["close"].pct_change()
-              X("ret1").fillna(0.0, inplace=True)
+              X["ret1"] = X["close"].pct_change().fillna(0.0)
               X["rvol20"] = X["volume"] / X["volume"].rolling(20).mean()
               X["hl_range"] = (X["high"]-X["low"]) / X["close"].shift()
               X["vwap"] = vwap(X)
@@ -88,12 +87,12 @@ jobs:
               X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
               X["vola20"] = X["ret1"].rolling(20).std()
               return X
-          """.replace('X("ret1")','X["ret1"]'))  # saugus fix dėl sintaksės
+          """)
 
           # -------- treniravimas --------
           w("train_intraday.py", """
           import argparse, numpy as np, pandas as pd, yfinance as yf, warnings, os
-          from tqdm import tqdm
+          from pandas.api.types import is_datetime64_any_dtype as is_dt
           from sklearn.preprocessing import StandardScaler
           from sklearn.ensemble import HistGradientBoostingClassifier
           from sklearn.metrics import classification_report, confusion_matrix
@@ -102,32 +101,42 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
+          def _infer_datetime_column(df):
+              # 1) jei indekse yra datetimes
+              if isinstance(df.index, pd.DatetimeIndex):
+                  return df.reset_index().rename(columns={"index":"datetime"})
+              # 2) ieškom stulpelio su pavadinimu
+              for cand in ["datetime","Datetime","date","Date","time","Time"]:
+                  if cand in df.columns:
+                      df = df.rename(columns={cand:"datetime"})
+                      df["datetime"] = pd.to_datetime(df["datetime"])
+                      return df
+              # 3) ieškom bet kurio datetime tipo stulpelio
+              for c in df.columns:
+                  if is_dt(df[c]):
+                      df = df.rename(columns={c:"datetime"})
+                      return df
+              # 4) kraštutinis: susikuriam iš indekso
+              df = df.reset_index()
+              if "index" in df.columns:
+                  df = df.rename(columns={"index":"datetime"})
+              df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+              return df
+
           def dl(ticker, period, interval):
-              # yfinance su intraday gali grąžinti Datetime index arba 'Datetime'/'Date' stulpelius
-              df = yf.download(
-                  ticker, period=period, interval=interval,
-                  auto_adjust=True, prepost=True, progress=False
-              )
-              # Jei multi-index (kai keli tickeriai) – neaktualu čia, bet tvarkom
+              df = yf.download(ticker, period=period, interval=interval,
+                               auto_adjust=True, prepost=True, progress=False)
+              if df is None or len(df)==0:
+                  return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
               if isinstance(df.index, pd.MultiIndex):
                   df = df.droplevel(1, axis=1)
-
-              # Perkeliam indeksą į stulpelį, jei tai DatetimeIndex
-              if isinstance(df.index, pd.DatetimeIndex):
-                  df = df.reset_index()
-
-              # Normalizuojam pavadinimą
-              if "Datetime" in df.columns:
-                  df = df.rename(columns={"Datetime": "datetime"})
-              elif "Date" in df.columns:
-                  df = df.rename(columns={"Date": "datetime"})
-              # Kraštutinis atvejis: jei nėra – kuriam iš indekso
+              df = _infer_datetime_column(df)
               if "datetime" not in df.columns:
+                  # paskutinė apsauga
                   df["datetime"] = pd.to_datetime(df.index)
-
+              # sutvarkom
               df["datetime"] = pd.to_datetime(df["datetime"])
-              df = df.sort_values("datetime").drop_duplicates("datetime")
-
+              df = df.sort_values("datetime").drop_duplicates(subset=["datetime"])
               cols = [c for c in ["datetime","Open","High","Low","Close","Volume"] if c in df.columns]
               df = df[cols].rename(columns=str.lower)
               return df
@@ -140,49 +149,12 @@ jobs:
           def build_features(df):
               return feature_table(df)
 
-          def to_sequences(fe_df, labels, window=60):
-              vals = fe_df.values.astype("float32"); y = labels.values
-              Xs, Ys = [], []
-              for i in range(window, len(vals)):
-                  Xs.append(vals[i-window:i, :]); Ys.append(y[i])
-              return np.array(Xs), np.array(Ys)
-
-          def try_import_tf():
-              try:
-                  import tensorflow as tf
-                  return tf
-              except Exception:
-                  return None
-
-          def train_tree(Xtr, ytr):
-              clf = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.07,
-                                                  l2_regularization=0.0, max_iter=300)
-              clf.fit(Xtr, ytr)
-              return clf
-
-          def train_lstm(Xtr_seq, ytr_seq, nfeat):
-              tf = try_import_tf()
-              if tf is None:
-                  return None
-              import tensorflow as tf
-              model = tf.keras.Sequential([
-                  tf.keras.layers.Input(shape=(Xtr_seq.shape[1], nfeat)),
-                  tf.keras.layers.Masking(mask_value=0.0),
-                  tf.keras.layers.LSTM(32),
-                  tf.keras.layers.Dense(16, activation="relu"),
-                  tf.keras.layers.Dense(3, activation="softmax")
-              ])
-              model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
-              model.fit(Xtr_seq, ytr_seq, epochs=3, batch_size=256, verbose=0)
-              return model
-
           def main(args):
               os.makedirs("out", exist_ok=True)
               tickers=[t.strip().upper() for t in args.tickers.split(",")]
               period=args.period; interval=args.interval
               horizon=int(args.horizon); thr=float(args.thr)
               prob_th=float(args.prob_th)
-              use_lstm = (args.model.lower()=="lstm")
 
               summary=[]
 
@@ -192,6 +164,7 @@ jobs:
                   if raw.empty:
                       print(f"⚠️ {tkr}: yfinance grąžino tuščią rinkinį. Praleidžiu.")
                       continue
+
                   feats = build_features(raw)
                   y_fwd, label = build_labels(feats, horizon, thr)
 
@@ -204,6 +177,7 @@ jobs:
                       print(f"⚠️ {tkr}: per mažai eilučių ({len(data)}). Praleidžiu.")
                       continue
 
+                  # Train/Test padalijimas
                   if len(data) < 1000:
                       split_idx = int(len(data)*0.8)
                   else:
@@ -219,39 +193,18 @@ jobs:
                   Xtr = scaler.fit_transform(train[feat_cols])
                   Xte = scaler.transform(test[feat_cols])
 
-                  model_name = "tree"
-                  clf_tree = None
-                  clf_lstm = None
-                  if use_lstm:
-                      tf = try_import_tf()
-                      if tf is None:
-                          print("⚠️ TensorFlow nerastas. Naudosiu 'tree' modelį.")
-                      else:
-                          Xtr_seq, ytr_seq = to_sequences(pd.DataFrame(Xtr, columns=feat_cols), train["label"], window=60)
-                          Xte_seq, yte_seq = to_sequences(pd.DataFrame(Xte, columns=feat_cols), test["label"],  window=60)
-                          clf_lstm = train_lstm(Xtr_seq, ytr_seq, nfeat=len(feat_cols))
-                          if clf_lstm is not None:
-                              model_name="lstm"
-                              proba = clf_lstm.predict(Xte_seq, verbose=0)
-                              y_pred = np.argmax(proba, axis=1) - 1
-                              test_use = test.iloc[60:].copy()
-                              test_use["pred_label"] = y_pred
-                              test_use["prob_up"] = proba[:,2]
-                              test_use["prob_dn"] = proba[:,0]
-                              test = test_use
-                          else:
-                              print("⚠️ LSTM nepavyko. Naudosiu 'tree'.")
+                  clf = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.07,
+                                                       l2_regularization=0.0, max_iter=300)
+                  clf.fit(Xtr, train["label"])
+                  proba = clf.predict_proba(Xte)
+                  classes = clf.classes_
+                  idx_up = list(classes).index(1) if 1 in classes else None
+                  idx_dn = list(classes).index(-1) if -1 in classes else None
+                  y_pred = clf.predict(Xte)
 
-                  if model_name=="tree":
-                      clf_tree = train_tree(Xtr, train["label"])
-                      proba = clf_tree.predict_proba(Xte)
-                      classes = clf_tree.classes_
-                      idx_up = list(classes).index(1) if 1 in classes else None
-                      idx_dn = list(classes).index(-1) if -1 in classes else None
-                      y_pred = clf_tree.predict(Xte)
-                      test["pred_label"] = y_pred
-                      test["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
-                      test["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
+                  test["pred_label"] = y_pred
+                  test["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
+                  test["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
 
                   test["signal"] = "HOLD"
                   test.loc[(test["pred_label"]==1) & (test["prob_up"]>=prob_th), "signal"] = "BUY"
@@ -263,7 +216,7 @@ jobs:
                   active = test[test["signal"]!="HOLD"]
                   acc_active = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
 
-                  print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}, model={model_name}")
+                  print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}")
                   print("Confusion matrix [-1,0,1]:", cm)
 
                   out = test[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
@@ -271,20 +224,21 @@ jobs:
 
                   dlast = out["datetime"].dt.date.iloc[-1]
                   show = out[out["datetime"].dt.date==dlast].copy()
-                  import numpy as np
+
                   plt.figure(figsize=(11,4), dpi=140)
-                  plt.plot(show["datetime"], show["y_fwd"], label="Realus {h}m pokytis".format(h={horizon}))
+                  plt.plot(show["datetime"], show["y_fwd"], label=f"Realus {horizon}m pokytis")
+                  import numpy as np
                   plt.plot(show["datetime"], np.where(show["pred_label"]==1,  thr, np.where(show["pred_label"]==-1, -thr, 0.0)),
                            label="Prognozuota (±thr)", alpha=0.8)
                   plt.axhline(thr, ls="--", alpha=.4); plt.axhline(-thr, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")
                   for s, c in [("BUY","green"), ("SELL","red")]:
                       m = show[show["signal"]==s]
                       plt.scatter(m["datetime"], np.zeros(len(m)), label=s, s=18, color=c)
-                  plt.title(f"{tkr} | {model_name.upper()} | accuracy(all)={acc_all:.2%} active={acc_active:.2%}")
+                  plt.title(f"{tkr} | accuracy(all)={acc_all:.2%} active={acc_active:.2%}")
                   plt.legend(); plt.tight_layout()
                   plt.savefig(f"out/intraday_{tkr}.png"); plt.close()
 
-                  summary.append([tkr, model_name, len(out), float(acc_all), float(acc_active), float(thr), float(prob_th)])
+                  summary.append([tkr, "tree", len(out), float(acc_all), float(acc_active), float(thr), float(prob_th)])
 
               pd.DataFrame(summary, columns=["ticker","model","n_test","acc_all","acc_active","thr","prob_th"]).to_csv("out/summary_intraday.csv", index=False)
 
@@ -307,11 +261,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: (Optional) Install LSTM deps
-        if: ${{ github.event.inputs.model == 'lstm' }}
-        run: |
-          pip install tensorflow-cpu==2.15.*
-
       - name: Train intraday momentum
         env:
           TICKERS:  ${{ github.event.inputs.tickers }}
@@ -319,7 +268,6 @@ jobs:
           INTERVAL: ${{ github.event.inputs.interval }}
           HORIZON:  ${{ github.event.inputs.horizon }}
           THR:      ${{ github.event.inputs.thr }}
-          MODEL:    ${{ github.event.inputs.model }}
           PROBTH:   ${{ github.event.inputs.prob_th }}
         run: |
           : ${TICKERS:=OPEN,PLTR}
@@ -327,9 +275,8 @@ jobs:
           : ${INTERVAL:=1m}
           : ${HORIZON:=15}
           : ${THR:=0.005}
-          : ${MODEL:=tree}
           : ${PROBTH:=0.55}
-          python train_intraday.py --tickers "$TICKERS" --period "$PERIOD" --interval "$INTERVAL" --horizon "$HORIZON" --thr "$THR" --model "$MODEL" --prob_th "$PROBTH"
+          python train_intraday.py --tickers "$TICKERS" --period "$PERIOD" --interval "$INTERVAL" --horizon "$HORIZON" --thr "$THR" --prob_th "$PROBTH"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -368,7 +315,7 @@ jobs:
           secure: false
           starttls: true
           body: |
-            Intraday scalp/momentum signalai (model=${{ github.event.inputs.model || 'tree' }}, horizon=${{ github.event.inputs.horizon || '15' }}min, thr=${{ github.event.inputs.thr || '0.005' }}, prob_th=${{ github.event.inputs.prob_th || '0.55' }}).
+            Intraday scalp/momentum signalai (horizon=${{ github.event.inputs.horizon || '15' }}min, thr=${{ github.event.inputs.thr || '0.005' }}, prob_th=${{ github.event.inputs.prob_th || '0.55' }}).
             Prieduose: summary + grafikai + CSV.
           attachments: |
             out/summary_intraday.csv

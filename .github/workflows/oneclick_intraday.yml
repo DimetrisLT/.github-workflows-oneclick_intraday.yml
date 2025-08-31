@@ -237,7 +237,8 @@ jobs:
                   acc_active = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
 
                   print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}, model={model_name}")
-                  print("Confusion matrix [-1,0,1]:\n", cm)  # <-- KABUTĖS UŽDARYTOS
+                  # FIX: jokio liekančio dvitaškio be uždarymo – spausdiname vienoje eilutėje:
+                  print("Confusion matrix [-1,0,1]:", cm)
 
                   out = test[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
                   out.to_csv(f"out/preds_intraday_{tkr}.csv", index=False)
@@ -246,6 +247,7 @@ jobs:
                   show = out[out["datetime"].dt.date==dlast].copy()
                   plt.figure(figsize=(11,4), dpi=140)
                   plt.plot(show["datetime"], show["y_fwd"], label="Realus 15m pokytis")
+                  import numpy as np
                   plt.plot(show["datetime"], np.where(show["pred_label"]==1,  thr, np.where(show["pred_label"]==-1, -thr, 0.0)),
                            label="Prognozuota (±thr)", alpha=0.8)
                   plt.axhline(thr, ls="--", alpha=.4); plt.axhline(-thr, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")

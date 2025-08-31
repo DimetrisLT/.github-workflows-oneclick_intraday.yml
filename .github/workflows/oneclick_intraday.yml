@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       tickers:   { description: "Tickers (comma-separated)", default: "OPEN,PLTR" }
-      period:    { description: "yfinance period (1m leidžia max ~7d)", default: "7d" }
+      period:    { description: "yfinance period (1m~7d max)", default: "7d" }
       interval:  { description: "Bar interval", default: "1m" }
       horizon:   { description: "Prognozės horizontas minutėmis", default: "15" }
       thr:       { description: "Judėjimo slenkstis (0.005=0.5%)", default: "0.005" }
       model:     { description: "tree arba lstm", default: "tree" }
-      prob_th:   { description: "Min. tikimybė imti signalą (0-1)", default: "0.55" }
+      prob_th:   { description: "Min. tikimybė signalui (0..1)", default: "0.55" }
   schedule:
-    - cron: "15 13 * * 1-5"   # apie 15 min iki NYSE (UTC); įtraukiamas premarket
+    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC); įtraukiamas premarket
 
 jobs:
   intraday:
@@ -29,7 +29,7 @@ jobs:
               pathlib.Path(os.path.dirname(p)).mkdir(parents=True, exist_ok=True)
               open(p,"w",encoding="utf-8").write(s.strip()+"\n")
 
-          # -------- requirements (be TF; LSTM bus optional) --------
+          # -------- requirements --------
           w("requirements.txt", """
           pandas>=2.0
           numpy>=1.23
@@ -89,7 +89,7 @@ jobs:
               return X
           """)
 
-          # -------- treniravimas (tree arba lstm su fallback) --------
+          # -------- treniravimas --------
           w("train_intraday.py", """
           import argparse, numpy as np, pandas as pd, yfinance as yf, warnings, os
           from tqdm import tqdm
@@ -98,7 +98,6 @@ jobs:
           from sklearn.ensemble import HistGradientBoostingClassifier
           from sklearn.metrics import classification_report, confusion_matrix
           import matplotlib.pyplot as plt
-
           from src.indicators_intraday import feature_table
 
           warnings.filterwarnings("ignore")
@@ -107,12 +106,11 @@ jobs:
               df = yf.download(ticker, period=period, interval=interval, auto_adjust=True,
                                prepost=True, progress=False)
               if isinstance(df.index, pd.MultiIndex):
-                  df = df.droplevel(1, axis=1)  # jei kelis tickerius parsisiųstum
+                  df = df.droplevel(1, axis=1)
               df = df.reset_index().rename(columns={"Datetime":"datetime","Date":"datetime"})
               df["datetime"] = pd.to_datetime(df["datetime"])
               df = df.sort_values("datetime").drop_duplicates("datetime")
-              return df[["datetime","Open","High","Low","Close","Volume"]].rename(
-                  columns=str.lower)
+              return df[["datetime","Open","High","Low","Close","Volume"]].rename(columns=str.lower)
 
           def build_labels(df, horizon, thr):
               y_fwd = df["close"].shift(-horizon)/df["close"] - 1.0
@@ -120,17 +118,13 @@ jobs:
               return y_fwd, label
 
           def build_features(df):
-              X = feature_table(df)
-              return X
+              return feature_table(df)
 
           def to_sequences(fe_df, labels, window=60):
-              # paruošiame LSTM sekas (t, window, feat)
-              vals = fe_df.values.astype("float32")
-              y = labels.values
+              vals = fe_df.values.astype("float32"); y = labels.values
               Xs, Ys = [], []
               for i in range(window, len(vals)):
-                  Xs.append(vals[i-window:i, :])
-                  Ys.append(y[i])
+                  Xs.append(vals[i-window:i, :]); Ys.append(y[i])
               return np.array(Xs), np.array(Ys)
 
           def try_import_tf():
@@ -183,7 +177,6 @@ jobs:
                   data["label"] = label
                   data = data.dropna().reset_index(drop=True)
 
-                  # Train/Test pagal laiką: paskutinė diena testui (arba paskutinis 15%)
                   if len(data) < 1000:
                       split_idx = int(len(data)*0.8)
                   else:
@@ -199,7 +192,6 @@ jobs:
                   Xtr = scaler.fit_transform(train[feat_cols])
                   Xte = scaler.transform(test[feat_cols])
 
-                  # --- modelis ---
                   model_name = "tree"
                   clf_tree = None
                   clf_lstm = None
@@ -213,10 +205,8 @@ jobs:
                           clf_lstm = train_lstm(Xtr_seq, ytr_seq, nfeat=len(feat_cols))
                           if clf_lstm is not None:
                               model_name="lstm"
-                              # prognozės
                               proba = clf_lstm.predict(Xte_seq, verbose=0)
-                              y_pred = np.argmax(proba, axis=1) - 1  # -> -1,0,1
-                              # sinchronizuojame indeksus (dėl window)
+                              y_pred = np.argmax(proba, axis=1) - 1
                               test_use = test.iloc[60:].copy()
                               test_use["pred_label"] = y_pred
                               test_use["prob_up"] = proba[:,2]
@@ -236,12 +226,10 @@ jobs:
                       test["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
                       test["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
 
-                  # signalas pagal tikimybes
                   test["signal"] = "HOLD"
                   test.loc[(test["pred_label"]==1) & (test["prob_up"]>=prob_th), "signal"] = "BUY"
                   test.loc[(test["pred_label"]==-1) & (test["prob_dn"]>=prob_th), "signal"] = "SELL"
 
-                  # metrikos
                   report = classification_report(test["label"], test["pred_label"], output_dict=True, zero_division=0)
                   cm = confusion_matrix(test["label"], test["pred_label"], labels=[-1,0,1])
                   acc_all = report["accuracy"]
@@ -249,20 +237,18 @@ jobs:
                   acc_active = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
 
                   print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}, model={model_name}")
-                  print("Confusion matrix [-1,0,1]:\n", cm)
+                  print("Confusion matrix [-1,0,1]:\n", cm)  # <-- KABUTĖS UŽDARYTOS
 
-                  # išsaugo CSV
                   out = test[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
                   out.to_csv(f"out/preds_intraday_{tkr}.csv", index=False)
 
-                  # grafikas paskutinei sesijai
                   dlast = out["datetime"].dt.date.iloc[-1]
                   show = out[out["datetime"].dt.date==dlast].copy()
                   plt.figure(figsize=(11,4), dpi=140)
                   plt.plot(show["datetime"], show["y_fwd"], label="Realus 15m pokytis")
-                  plt.plot(show["datetime"], np.where(show["pred_label"]==1,  th, np.where(show["pred_label"]==-1, -th, 0.0)),
+                  plt.plot(show["datetime"], np.where(show["pred_label"]==1,  thr, np.where(show["pred_label"]==-1, -thr, 0.0)),
                            label="Prognozuota (±thr)", alpha=0.8)
-                  plt.axhline(th, ls="--", alpha=.4); plt.axhline(-th, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")
+                  plt.axhline(thr, ls="--", alpha=.4); plt.axhline(-thr, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")
                   for s, c in [("BUY","green"), ("SELL","red")]:
                       m = show[show["signal"]==s]
                       plt.scatter(m["datetime"], np.zeros(len(m)), label=s, s=18, color=c)
@@ -281,7 +267,7 @@ jobs:
               ap.add_argument("--interval",type=str, default="1m")
               ap.add_argument("--horizon", type=str, default="15")
               ap.add_argument("--thr",     type=str, default="0.005")
-              ap.add_argument("--model",   type=str, default="tree")   # 'tree' arba 'lstm'
+              ap.add_argument("--model",   type=str, default="tree")
               ap.add_argument("--prob_th", type=str, default="0.55")
               args = ap.parse_args()
               main(args)
@@ -350,7 +336,7 @@ jobs:
           password: ${{ secrets.SMTP_PASSWORD }}
           to:       ${{ secrets.MAIL_TO }}
           from:     ${{ secrets.MAIL_FROM }}
-          subject:  "Intraday momentum ({{ github.event.inputs.interval || '1m' }}) — ${{ github.event.inputs.tickers || 'OPEN,PLTR' }}"
+          subject:  "Intraday momentum — ${{ github.event.inputs.tickers || 'OPEN,PLTR' }} (interval=${{ github.event.inputs.interval || '1m' }})"
           secure: false
           starttls: true
           body: |

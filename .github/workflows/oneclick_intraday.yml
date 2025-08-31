@@ -1,0 +1,362 @@
+name: One-Click Intraday Momentum (1m, scalp)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:   { description: "Tickers (comma-separated)", default: "OPEN,PLTR" }
+      period:    { description: "yfinance period (1m leidžia max ~7d)", default: "7d" }
+      interval:  { description: "Bar interval", default: "1m" }
+      horizon:   { description: "Prognozės horizontas minutėmis", default: "15" }
+      thr:       { description: "Judėjimo slenkstis (0.005=0.5%)", default: "0.005" }
+      model:     { description: "tree arba lstm", default: "tree" }
+      prob_th:   { description: "Min. tikimybė imti signalą (0-1)", default: "0.55" }
+  schedule:
+    - cron: "15 13 * * 1-5"   # apie 15 min iki NYSE (UTC); įtraukiamas premarket
+
+jobs:
+  intraday:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Create project files
+        run: |
+          python - << "PY"
+          import os, pathlib
+          def w(p,s):
+              pathlib.Path(os.path.dirname(p)).mkdir(parents=True, exist_ok=True)
+              open(p,"w",encoding="utf-8").write(s.strip()+"\n")
+
+          # -------- requirements (be TF; LSTM bus optional) --------
+          w("requirements.txt", """
+          pandas>=2.0
+          numpy>=1.23
+          yfinance>=0.2.40
+          scikit-learn>=1.3
+          matplotlib>=3.7
+          scipy>=1.10
+          tqdm>=4.66
+          """)
+
+          # -------- indikatoriai --------
+          w("src/indicators_intraday.py", """
+          import numpy as np, pandas as pd
+
+          def rsi(series, n=14):
+              delta = series.diff()
+              up = np.where(delta>0, delta, 0.0)
+              down = np.where(delta<0, -delta, 0.0)
+              roll_up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+              roll_dn = pd.Series(down, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+              rs = roll_up / (roll_dn.replace(0, np.nan))
+              return 100 - (100/(1+rs))
+
+          def macd(series, fast=12, slow=26, signal=9):
+              ema_fast = series.ewm(span=fast, adjust=False).mean()
+              ema_slow = series.ewm(span=slow, adjust=False).mean()
+              macd_line = ema_fast - ema_slow
+              signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+              hist = macd_line - signal_line
+              return macd_line, signal_line, hist
+
+          def vwap(df):
+              tp = (df["high"] + df["low"] + df["close"]) / 3.0
+              pv = (tp * df["volume"]).cumsum()
+              vv = (df["volume"]).cumsum().replace(0, np.nan)
+              return pv / vv
+
+          def obv(df):
+              ret = df["close"].pct_change().fillna(0.0)
+              return (np.sign(ret)*df["volume"]).cumsum()
+
+          def feature_table(df):
+              X = df.copy()
+              X["ret1"] = X["close"].pct_change()
+              X["rvol20"] = X["volume"] / X["volume"].rolling(20).mean()
+              X["hl_range"] = (X["high"]-X["low"]) / X["close"].shift()
+              X["vwap"] = vwap(X)
+              X["obv"] = obv(X)
+              X["ema5"] = X["close"].ewm(span=5, adjust=False).mean()
+              X["ema20"] = X["close"].ewm(span=20, adjust=False).mean()
+              X["ema_ratio"] = (X["close"] - X["ema5"]) / X["ema20"]
+              r = rsi(X["close"], 14)
+              X["rsi14"] = r
+              m, s, h = macd(X["close"], 12,26,9)
+              X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
+              X["vola20"] = X["ret1"].rolling(20).std()
+              return X
+          """)
+
+          # -------- treniravimas (tree arba lstm su fallback) --------
+          w("train_intraday.py", """
+          import argparse, numpy as np, pandas as pd, yfinance as yf, warnings, os
+          from tqdm import tqdm
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.experimental import enable_hist_gradient_boosting  # noqa
+          from sklearn.ensemble import HistGradientBoostingClassifier
+          from sklearn.metrics import classification_report, confusion_matrix
+          import matplotlib.pyplot as plt
+
+          from src.indicators_intraday import feature_table
+
+          warnings.filterwarnings("ignore")
+
+          def dl(ticker, period, interval):
+              df = yf.download(ticker, period=period, interval=interval, auto_adjust=True,
+                               prepost=True, progress=False)
+              if isinstance(df.index, pd.MultiIndex):
+                  df = df.droplevel(1, axis=1)  # jei kelis tickerius parsisiųstum
+              df = df.reset_index().rename(columns={"Datetime":"datetime","Date":"datetime"})
+              df["datetime"] = pd.to_datetime(df["datetime"])
+              df = df.sort_values("datetime").drop_duplicates("datetime")
+              return df[["datetime","Open","High","Low","Close","Volume"]].rename(
+                  columns=str.lower)
+
+          def build_labels(df, horizon, thr):
+              y_fwd = df["close"].shift(-horizon)/df["close"] - 1.0
+              label = np.where(y_fwd >= thr, 1, np.where(y_fwd <= -thr, -1, 0))
+              return y_fwd, label
+
+          def build_features(df):
+              X = feature_table(df)
+              return X
+
+          def to_sequences(fe_df, labels, window=60):
+              # paruošiame LSTM sekas (t, window, feat)
+              vals = fe_df.values.astype("float32")
+              y = labels.values
+              Xs, Ys = [], []
+              for i in range(window, len(vals)):
+                  Xs.append(vals[i-window:i, :])
+                  Ys.append(y[i])
+              return np.array(Xs), np.array(Ys)
+
+          def try_import_tf():
+              try:
+                  import tensorflow as tf
+                  return tf
+              except Exception:
+                  return None
+
+          def train_tree(Xtr, ytr):
+              clf = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.07,
+                                                  l2_regularization=0.0, max_iter=300)
+              clf.fit(Xtr, ytr)
+              return clf
+
+          def train_lstm(Xtr_seq, ytr_seq, nfeat):
+              tf = try_import_tf()
+              if tf is None:
+                  return None
+              import tensorflow as tf
+              model = tf.keras.Sequential([
+                  tf.keras.layers.Input(shape=(Xtr_seq.shape[1], nfeat)),
+                  tf.keras.layers.Masking(mask_value=0.0),
+                  tf.keras.layers.LSTM(32),
+                  tf.keras.layers.Dense(16, activation="relu"),
+                  tf.keras.layers.Dense(3, activation="softmax")
+              ])
+              model.compile(optimizer="adam", loss="sparse_categorical_crossentropy", metrics=["accuracy"])
+              model.fit(Xtr_seq, ytr_seq, epochs=3, batch_size=256, verbose=0)
+              return model
+
+          def main(args):
+              os.makedirs("out", exist_ok=True)
+              tickers=[t.strip().upper() for t in args.tickers.split(",")]
+              period=args.period; interval=args.interval
+              horizon=int(args.horizon); thr=float(args.thr)
+              prob_th=float(args.prob_th)
+              use_lstm = (args.model.lower()=="lstm")
+
+              summary=[]
+
+              for tkr in tickers:
+                  print(f"=== {tkr} | {interval} | period={period} | horizon={horizon}min | thr={thr}")
+                  raw = dl(tkr, period, interval)
+                  feats = build_features(raw)
+                  y_fwd, label = build_labels(feats, horizon, thr)
+
+                  data = feats.copy()
+                  data["y_fwd"] = y_fwd
+                  data["label"] = label
+                  data = data.dropna().reset_index(drop=True)
+
+                  # Train/Test pagal laiką: paskutinė diena testui (arba paskutinis 15%)
+                  if len(data) < 1000:
+                      split_idx = int(len(data)*0.8)
+                  else:
+                      last_day = data["datetime"].dt.date.iloc[-1]
+                      prev = data[data["datetime"].dt.date < last_day]
+                      split_idx = len(prev) if len(prev)>400 else int(len(data)*0.85)
+
+                  train = data.iloc[:split_idx].copy()
+                  test  = data.iloc[split_idx:].copy()
+
+                  feat_cols = [c for c in feats.columns if c not in ["datetime"]]
+                  scaler = StandardScaler()
+                  Xtr = scaler.fit_transform(train[feat_cols])
+                  Xte = scaler.transform(test[feat_cols])
+
+                  # --- modelis ---
+                  model_name = "tree"
+                  clf_tree = None
+                  clf_lstm = None
+                  if use_lstm:
+                      tf = try_import_tf()
+                      if tf is None:
+                          print("⚠️ TensorFlow nerastas. Naudosiu 'tree' modelį.")
+                      else:
+                          Xtr_seq, ytr_seq = to_sequences(pd.DataFrame(Xtr, columns=feat_cols), train["label"], window=60)
+                          Xte_seq, yte_seq = to_sequences(pd.DataFrame(Xte, columns=feat_cols), test["label"],  window=60)
+                          clf_lstm = train_lstm(Xtr_seq, ytr_seq, nfeat=len(feat_cols))
+                          if clf_lstm is not None:
+                              model_name="lstm"
+                              # prognozės
+                              proba = clf_lstm.predict(Xte_seq, verbose=0)
+                              y_pred = np.argmax(proba, axis=1) - 1  # -> -1,0,1
+                              # sinchronizuojame indeksus (dėl window)
+                              test_use = test.iloc[60:].copy()
+                              test_use["pred_label"] = y_pred
+                              test_use["prob_up"] = proba[:,2]
+                              test_use["prob_dn"] = proba[:,0]
+                              test = test_use
+                          else:
+                              print("⚠️ LSTM nepavyko. Naudosiu 'tree'.")
+
+                  if model_name=="tree":
+                      clf_tree = train_tree(Xtr, train["label"])
+                      proba = clf_tree.predict_proba(Xte)
+                      classes = clf_tree.classes_  # pvz [-1,0,1]
+                      idx_up = list(classes).index(1) if 1 in classes else None
+                      idx_dn = list(classes).index(-1) if -1 in classes else None
+                      y_pred = clf_tree.predict(Xte)
+                      test["pred_label"] = y_pred
+                      test["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
+                      test["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
+
+                  # signalas pagal tikimybes
+                  test["signal"] = "HOLD"
+                  test.loc[(test["pred_label"]==1) & (test["prob_up"]>=prob_th), "signal"] = "BUY"
+                  test.loc[(test["pred_label"]==-1) & (test["prob_dn"]>=prob_th), "signal"] = "SELL"
+
+                  # metrikos
+                  report = classification_report(test["label"], test["pred_label"], output_dict=True, zero_division=0)
+                  cm = confusion_matrix(test["label"], test["pred_label"], labels=[-1,0,1])
+                  acc_all = report["accuracy"]
+                  active = test[test["signal"]!="HOLD"]
+                  acc_active = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
+
+                  print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}, model={model_name}")
+                  print("Confusion matrix [-1,0,1]:\n", cm)
+
+                  # išsaugo CSV
+                  out = test[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
+                  out.to_csv(f"out/preds_intraday_{tkr}.csv", index=False)
+
+                  # grafikas paskutinei sesijai
+                  dlast = out["datetime"].dt.date.iloc[-1]
+                  show = out[out["datetime"].dt.date==dlast].copy()
+                  plt.figure(figsize=(11,4), dpi=140)
+                  plt.plot(show["datetime"], show["y_fwd"], label="Realus 15m pokytis")
+                  plt.plot(show["datetime"], np.where(show["pred_label"]==1,  th, np.where(show["pred_label"]==-1, -th, 0.0)),
+                           label="Prognozuota (±thr)", alpha=0.8)
+                  plt.axhline(th, ls="--", alpha=.4); plt.axhline(-th, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")
+                  for s, c in [("BUY","green"), ("SELL","red")]:
+                      m = show[show["signal"]==s]
+                      plt.scatter(m["datetime"], np.zeros(len(m)), label=s, s=18, color=c)
+                  plt.title(f"{tkr} | {model_name.upper()} | accuracy(all)={acc_all:.2%} active={acc_active:.2%}")
+                  plt.legend(); plt.tight_layout()
+                  plt.savefig(f"out/intraday_{tkr}.png"); plt.close()
+
+                  summary.append([tkr, model_name, len(out), float(acc_all), float(acc_active), float(thr), float(prob_th)])
+
+              pd.DataFrame(summary, columns=["ticker","model","n_test","acc_all","acc_active","thr","prob_th"]).to_csv("out/summary_intraday.csv", index=False)
+
+          if __name__=="__main__":
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--tickers", type=str, default="OPEN,PLTR")
+              ap.add_argument("--period",  type=str, default="7d")
+              ap.add_argument("--interval",type=str, default="1m")
+              ap.add_argument("--horizon", type=str, default="15")
+              ap.add_argument("--thr",     type=str, default="0.005")
+              ap.add_argument("--model",   type=str, default="tree")   # 'tree' arba 'lstm'
+              ap.add_argument("--prob_th", type=str, default="0.55")
+              args = ap.parse_args()
+              main(args)
+          """)
+          PY
+
+      - name: Install base deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: (Optional) Install LSTM deps
+        if: ${{ github.event.inputs.model == 'lstm' }}
+        run: |
+          pip install tensorflow-cpu==2.15.*
+
+      - name: Train intraday momentum
+        env:
+          TICKERS:  ${{ github.event.inputs.tickers }}
+          PERIOD:   ${{ github.event.inputs.period }}
+          INTERVAL: ${{ github.event.inputs.interval }}
+          HORIZON:  ${{ github.event.inputs.horizon }}
+          THR:      ${{ github.event.inputs.thr }}
+          MODEL:    ${{ github.event.inputs.model }}
+          PROBTH:   ${{ github.event.inputs.prob_th }}
+        run: |
+          : ${TICKERS:=OPEN,PLTR}
+          : ${PERIOD:=7d}
+          : ${INTERVAL:=1m}
+          : ${HORIZON:=15}
+          : ${THR:=0.005}
+          : ${MODEL:=tree}
+          : ${PROBTH:=0.55}
+          python train_intraday.py --tickers "$TICKERS" --period "$PERIOD" --interval "$INTERVAL" --horizon "$HORIZON" --thr "$THR" --model "$MODEL" --prob_th "$PROBTH"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: intraday_out
+          path: out
+
+      - name: Check mail secrets
+        id: mail
+        env:
+          HAS_SERVER: ${{ secrets.SMTP_SERVER }}
+          HAS_PORT: ${{ secrets.SMTP_PORT }}
+          HAS_USER: ${{ secrets.SMTP_USERNAME }}
+          HAS_PASS: ${{ secrets.SMTP_PASSWORD }}
+          HAS_TO: ${{ secrets.MAIL_TO }}
+          HAS_FROM: ${{ secrets.MAIL_FROM }}
+        run: |
+          if [ -n "$HAS_SERVER" ] && [ -n "$HAS_PORT" ] && [ -n "$HAS_USER" ] && [ -n "$HAS_PASS" ] && [ -n "$HAS_TO" ] && [ -n "$HAS_FROM" ]; then
+            echo "send=true" >> $GITHUB_OUTPUT
+          else
+            echo "send=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Mail secrets not fully set. Skipping email step."
+          fi
+
+      - name: Email intraday signals
+        if: ${{ steps.mail.outputs.send == 'true' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          to:       ${{ secrets.MAIL_TO }}
+          from:     ${{ secrets.MAIL_FROM }}
+          subject:  "Intraday momentum ({{ github.event.inputs.interval || '1m' }}) — ${{ github.event.inputs.tickers || 'OPEN,PLTR' }}"
+          secure: false
+          starttls: true
+          body: |
+            Intraday scalp/momentum signalai (model=${{ github.event.inputs.model || 'tree' }}, horizon=${{ github.event.inputs.horizon || '15' }}min, thr=${{ github.event.inputs.thr || '0.005' }}, prob_th=${{ github.event.inputs.prob_th || '0.55' }}).
+            Prieduose: summary + grafikai + CSV.
+          attachments: |
+            out/summary_intraday.csv
+            out/intraday_*.png
+            out/preds_intraday_*.csv

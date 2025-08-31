@@ -17,10 +17,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
       - name: Create project files (safe here-docs)
         run: |
@@ -90,19 +88,19 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
-          def _force_datetime(df):
+          def _force_datetime(df: pd.DataFrame) -> pd.DataFrame:
               """
-              Grąžina df su privalomu 'datetime' stulpeliu:
-              - reset_index()
-              - parenka kandidatą (datetime/date/time/timestamp/index) arba pirmą stulpelį
-              - paverčia į datetime ir atmeta NaN
+              Užtikrina, kad df TIKRAI turėtų 'datetime' kaip stulpelį.
               """
               df = pd.DataFrame(df).reset_index()
-              cands = [c for c in df.columns if str(c).lower() in ("datetime","date","time","timestamp","index")]
+              # bandome rasti logišką datų stulpelį
+              cands = [c for c in df.columns
+                       if str(c).lower() in ("datetime","date","time","timestamp")]
               if not cands:
-                  cands = [df.columns[0]]
+                  # jei neradom – imame 'index' jei yra, arba pirma stulpelį
+                  cands = ["index"] if "index" in df.columns else [df.columns[0]]
               dtcol = cands[0]
-              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce")
+              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce", utc=True)
               df = df[df["datetime"].notna()]
               return df
 
@@ -111,12 +109,28 @@ jobs:
                                auto_adjust=True, prepost=True, progress=False)
               if df is None or len(df)==0:
                   return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
+
+              # 1) prievarta suformuojame datetime stulpelį
               df = _force_datetime(df)
-              keep_src = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-              df = df[["datetime"] + keep_src].rename(columns=str.lower)
+
+              # 2) jeigu dėl bet ko jo neturime – suformuojame dar kartą iš indekso/pirmo stulpelio
+              if "datetime" not in df.columns:
+                  tmp = df.reset_index()
+                  src = "index" if "index" in tmp.columns else tmp.columns[0]
+                  tmp["datetime"] = pd.to_datetime(tmp[src], errors="coerce", utc=True)
+                  df = tmp[tmp["datetime"].notna()]
+
+              # 3) saugi kainų/volume atranka (kas yra – tą imam)
+              price_cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+              df = df[["datetime"] + price_cols].rename(columns=str.lower)
+
+              # 4) rikiavimas + dublikatai (tik jei tikrai turime 'datetime' stulpelį)
               df = df.sort_values("datetime")
               if "datetime" in df.columns:
                   df = df.drop_duplicates(subset=["datetime"])
+              else:
+                  df = df.drop_duplicates()
+
               return df
 
           def build_labels(df, horizon, thr):

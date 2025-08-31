@@ -74,6 +74,7 @@ jobs:
           def feature_table(df):
               X = df.copy()
               X["ret1"] = X["close"].pct_change()
+              X("ret1").fillna(0.0, inplace=True)
               X["rvol20"] = X["volume"] / X["volume"].rolling(20).mean()
               X["hl_range"] = (X["high"]-X["low"]) / X["close"].shift()
               X["vwap"] = vwap(X)
@@ -87,14 +88,13 @@ jobs:
               X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
               X["vola20"] = X["ret1"].rolling(20).std()
               return X
-          """)
+          """.replace('X("ret1")','X["ret1"]'))  # saugus fix dėl sintaksės
 
           # -------- treniravimas --------
           w("train_intraday.py", """
           import argparse, numpy as np, pandas as pd, yfinance as yf, warnings, os
           from tqdm import tqdm
           from sklearn.preprocessing import StandardScaler
-          from sklearn.experimental import enable_hist_gradient_boosting  # noqa
           from sklearn.ensemble import HistGradientBoostingClassifier
           from sklearn.metrics import classification_report, confusion_matrix
           import matplotlib.pyplot as plt
@@ -103,14 +103,34 @@ jobs:
           warnings.filterwarnings("ignore")
 
           def dl(ticker, period, interval):
-              df = yf.download(ticker, period=period, interval=interval, auto_adjust=True,
-                               prepost=True, progress=False)
+              # yfinance su intraday gali grąžinti Datetime index arba 'Datetime'/'Date' stulpelius
+              df = yf.download(
+                  ticker, period=period, interval=interval,
+                  auto_adjust=True, prepost=True, progress=False
+              )
+              # Jei multi-index (kai keli tickeriai) – neaktualu čia, bet tvarkom
               if isinstance(df.index, pd.MultiIndex):
                   df = df.droplevel(1, axis=1)
-              df = df.reset_index().rename(columns={"Datetime":"datetime","Date":"datetime"})
+
+              # Perkeliam indeksą į stulpelį, jei tai DatetimeIndex
+              if isinstance(df.index, pd.DatetimeIndex):
+                  df = df.reset_index()
+
+              # Normalizuojam pavadinimą
+              if "Datetime" in df.columns:
+                  df = df.rename(columns={"Datetime": "datetime"})
+              elif "Date" in df.columns:
+                  df = df.rename(columns={"Date": "datetime"})
+              # Kraštutinis atvejis: jei nėra – kuriam iš indekso
+              if "datetime" not in df.columns:
+                  df["datetime"] = pd.to_datetime(df.index)
+
               df["datetime"] = pd.to_datetime(df["datetime"])
               df = df.sort_values("datetime").drop_duplicates("datetime")
-              return df[["datetime","Open","High","Low","Close","Volume"]].rename(columns=str.lower)
+
+              cols = [c for c in ["datetime","Open","High","Low","Close","Volume"] if c in df.columns]
+              df = df[cols].rename(columns=str.lower)
+              return df
 
           def build_labels(df, horizon, thr):
               y_fwd = df["close"].shift(-horizon)/df["close"] - 1.0
@@ -169,6 +189,9 @@ jobs:
               for tkr in tickers:
                   print(f"=== {tkr} | {interval} | period={period} | horizon={horizon}min | thr={thr}")
                   raw = dl(tkr, period, interval)
+                  if raw.empty:
+                      print(f"⚠️ {tkr}: yfinance grąžino tuščią rinkinį. Praleidžiu.")
+                      continue
                   feats = build_features(raw)
                   y_fwd, label = build_labels(feats, horizon, thr)
 
@@ -176,6 +199,10 @@ jobs:
                   data["y_fwd"] = y_fwd
                   data["label"] = label
                   data = data.dropna().reset_index(drop=True)
+
+                  if len(data) < 200:
+                      print(f"⚠️ {tkr}: per mažai eilučių ({len(data)}). Praleidžiu.")
+                      continue
 
                   if len(data) < 1000:
                       split_idx = int(len(data)*0.8)
@@ -218,7 +245,7 @@ jobs:
                   if model_name=="tree":
                       clf_tree = train_tree(Xtr, train["label"])
                       proba = clf_tree.predict_proba(Xte)
-                      classes = clf_tree.classes_  # pvz [-1,0,1]
+                      classes = clf_tree.classes_
                       idx_up = list(classes).index(1) if 1 in classes else None
                       idx_dn = list(classes).index(-1) if -1 in classes else None
                       y_pred = clf_tree.predict(Xte)
@@ -237,7 +264,6 @@ jobs:
                   acc_active = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
 
                   print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_active:.3f}, model={model_name}")
-                  # FIX: jokio liekančio dvitaškio be uždarymo – spausdiname vienoje eilutėje:
                   print("Confusion matrix [-1,0,1]:", cm)
 
                   out = test[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
@@ -245,9 +271,9 @@ jobs:
 
                   dlast = out["datetime"].dt.date.iloc[-1]
                   show = out[out["datetime"].dt.date==dlast].copy()
-                  plt.figure(figsize=(11,4), dpi=140)
-                  plt.plot(show["datetime"], show["y_fwd"], label="Realus 15m pokytis")
                   import numpy as np
+                  plt.figure(figsize=(11,4), dpi=140)
+                  plt.plot(show["datetime"], show["y_fwd"], label="Realus {h}m pokytis".format(h={horizon}))
                   plt.plot(show["datetime"], np.where(show["pred_label"]==1,  thr, np.where(show["pred_label"]==-1, -thr, 0.0)),
                            label="Prognozuota (±thr)", alpha=0.8)
                   plt.axhline(thr, ls="--", alpha=.4); plt.axhline(-thr, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")

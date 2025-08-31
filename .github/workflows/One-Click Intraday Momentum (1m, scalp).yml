@@ -44,9 +44,9 @@ jobs:
           import numpy as np, pandas as pd
 
           def rsi(series, n=14):
-              delta = series.diff()
-              up = np.where(delta>0, delta, 0.0)
-              dn = np.where(delta<0, -delta, 0.0)
+              d = series.diff()
+              up = np.where(d>0, d, 0.0)
+              dn = np.where(d<0, -d, 0.0)
               up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
               dn = pd.Series(dn, index=series.index).ewm(alpha=1/n, adjust=False).mean()
               rs = up / dn.replace(0, np.nan)
@@ -57,7 +57,7 @@ jobs:
               ema_s = series.ewm(span=slow, adjust=False).mean()
               m = ema_f - ema_s
               s = m.ewm(span=signal, adjust=False).mean()
-              return m, s, m - s
+              return m, s, m-s
 
           def vwap(df):
               tp = (df["high"] + df["low"] + df["close"]) / 3.0
@@ -95,36 +95,38 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
+          def _force_datetime(df):
+              """
+              Grąžina df su privalomu 'datetime' stulpeliu:
+              - reset_index()
+              - randa kandidatą iš pavadinimų arba pirmą stulpelį
+              - konvertuoja į datetime (errors='coerce')
+              - pašalina NaN datetime
+              """
+              df = pd.DataFrame(df).reset_index()
+              # galimi pavadinimai
+              candidates = [c for c in df.columns if str(c).lower() in ("datetime","date","time","timestamp","index")]
+              if not candidates:
+                  # jeigu vis dar nėra – imame pirmą stulpelį
+                  candidates = [df.columns[0]]
+              dtcol = candidates[0]
+              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce")
+              df = df[df["datetime"].notna()]
+              return df
+
           def dl(ticker, period, interval):
               df = yf.download(ticker, period=period, interval=interval,
                                auto_adjust=True, prepost=True, progress=False)
-              # jeigu tuščia – grąžinam tuščią su reikiamais stulpeliais
               if df is None or len(df)==0:
                   return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
-
-              # Visada resetinam index -> gausime 'Datetime' ar 'index' stulpelį
-              df = df.reset_index()
-
-              # Bandome rasti datų stulpelį
-              dtcol = None
-              for c in ["Datetime","Date","datetime","date","time","Time","index"]:
-                  if c in df.columns:
-                      dtcol = c
-                      break
-              if dtcol is None:
-                  # jei vis dar neradom – imam pirmą stulpelį
-                  dtcol = df.columns[0]
-
-              # Sukuriame normalizuotą 'datetime'
-              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce")
-              df = df.dropna(subset=["datetime"])
-
-              # Paliekame tik tai, kas tikrai yra
-              keep = ["datetime"] + [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-              df = df[keep].rename(columns=str.lower)
-
-              # Rūšiuojam ir šalinam dublikatus jau turint 'datetime'
-              df = df.sort_values("datetime").drop_duplicates(subset=["datetime"])
+              df = _force_datetime(df)
+              # pasiliekam reikiamus price/volume
+              keep_src = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+              df = df[["datetime"] + keep_src].rename(columns=str.lower)
+              # rikiavimas + dublikatai
+              df = df.sort_values("datetime")
+              if "datetime" in df.columns:
+                  df = df.drop_duplicates(subset=["datetime"])
               return df
 
           def build_labels(df, horizon, thr):
@@ -135,11 +137,9 @@ jobs:
           def main(args):
               os.makedirs("out", exist_ok=True)
               tickers=[t.strip().upper() for t in args.tickers.split(",")]
-              horizon=int(args.horizon); thr=float(args.thr)
-              prob_th=float(args.prob_th)
+              horizon=int(args.horizon); thr=float(args.thr); prob_th=float(args.prob_th)
 
               summary=[]
-
               for tkr in tickers:
                   print(f"=== {tkr} | {args.interval} | period={args.period} | horizon={horizon}min | thr={thr}")
                   raw = dl(tkr, args.period, args.interval)
@@ -149,7 +149,6 @@ jobs:
 
                   feats = feature_table(raw)
                   y_fwd, label = build_labels(feats, horizon, thr)
-
                   data = feats.copy()
                   data["y_fwd"] = y_fwd
                   data["label"] = label
@@ -159,14 +158,13 @@ jobs:
                       print(f"⚠️ {tkr}: per mažai eilučių ({len(data)}). Praleidžiu.")
                       continue
 
-                  # padalijimas train/test (paskutinė diena į testą, jei pakanka)
+                  # Train/Test padalijimas
                   if len(data) < 1000:
                       split = int(len(data)*0.8)
                   else:
                       last = data["datetime"].dt.date.iloc[-1]
                       prev = data[data["datetime"].dt.date < last]
                       split = len(prev) if len(prev)>400 else int(len(data)*0.85)
-
                   tr = data.iloc[:split].copy()
                   te = data.iloc[split:].copy()
 

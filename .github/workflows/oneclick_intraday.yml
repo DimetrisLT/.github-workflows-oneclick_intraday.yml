@@ -10,7 +10,7 @@ on:
       thr:       { description: "Judėjimo slenkstis (0.005=0.5%)", default: "0.005" }
       prob_th:   { description: "Min. tikimybė signalui (0..1)", default: "0.55" }
   schedule:
-    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC); įtraukiamas premarket
+    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC), įtraukiamas premarket
 
 jobs:
   intraday:
@@ -26,7 +26,7 @@ jobs:
           import os, pathlib
           def w(path, text):
               pathlib.Path(os.path.dirname(path)).mkdir(parents=True, exist_ok=True)
-              open(path, "w", encoding="utf-8").write(text.strip() + "\n")
+              open(path, "w", encoding="utf-8").write(text.strip()+"\n")
 
           # ---------- requirements ----------
           w("requirements.txt", """
@@ -44,9 +44,9 @@ jobs:
           import numpy as np, pandas as pd
 
           def rsi(series, n=14):
-              delta = series.diff()
-              up = np.where(delta>0, delta, 0.0)
-              dn = np.where(delta<0, -delta, 0.0)
+              d = series.diff()
+              up = np.where(d>0, d, 0.0)
+              dn = np.where(d<0, -d, 0.0)
               up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
               dn = pd.Series(dn, index=series.index).ewm(alpha=1/n, adjust=False).mean()
               rs = up / dn.replace(0, np.nan)
@@ -86,7 +86,8 @@ jobs:
 
           # ---------- training ----------
           w("train_intraday.py", """
-          import argparse, os, warnings, numpy as np, pandas as pd, yfinance as yf
+          import argparse, os, warnings
+          import numpy as np, pandas as pd, yfinance as yf
           from sklearn.preprocessing import StandardScaler
           from sklearn.ensemble import HistGradientBoostingClassifier
           from sklearn.metrics import classification_report, confusion_matrix
@@ -98,33 +99,42 @@ jobs:
           def dl(ticker, period, interval):
               df = yf.download(ticker, period=period, interval=interval,
                                auto_adjust=True, prepost=True, progress=False)
-              # jeigu tuščia – grąžinam tuščią su reikiamais stulpeliais
+              # jei tuščia – grąžinam tuščią su reikiamais stulpeliais
               if df is None or len(df)==0:
                   return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
 
-              # Visada resetinam index -> gausime 'Datetime' ar 'index' stulpelį
+              # Visada iškeliam index į stulpelį
               df = df.reset_index()
 
-              # Bandome rasti datų stulpelį
-              dtcol = None
-              for c in ["Datetime","Date","datetime","date","time","Time","index"]:
+              # Surandam tinkamiausią datų stulpelį
+              cand = None
+              for name in ["Datetime","Date","datetime","date","time","Time","index"]:
+                  if name in df.columns:
+                      cand = name; break
+              if cand is None:
+                  # pabandom rasti bet kurį datetime tipo stulpelį
+                  for c in df.columns:
+                      if np.issubdtype(df[c].dtype, np.datetime64):
+                          cand = c; break
+              if cand is None:
+                  cand = df.columns[0]  # kraštutinis atvejis
+
+              # Sukuriam/normalizuojam 'datetime'
+              df["datetime"] = pd.to_datetime(df[cand], errors="coerce")
+              df = df.loc[df["datetime"].notna()].copy()     # <- jokių KeyError
+
+              # Susirenkam prieinamus kainų stulpelius
+              price_map = {}
+              for c in ["Open","High","Low","Close","Volume","open","high","low","close","volume"]:
                   if c in df.columns:
-                      dtcol = c
-                      break
-              if dtcol is None:
-                  # jei vis dar neradom – imam pirmą stulpelį
-                  dtcol = df.columns[0]
-
-              # Sukuriame normalizuotą 'datetime'
-              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce")
-              df = df.dropna(subset=["datetime"])
-
-              # Paliekame tik tai, kas tikrai yra
-              keep = ["datetime"] + [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+                      price_map[c] = c.lower()
+              keep = ["datetime"] + list(price_map.keys())
               df = df[keep].rename(columns=str.lower)
 
-              # Rūšiuojam ir šalinam dublikatus jau turint 'datetime'
-              df = df.sort_values("datetime").drop_duplicates(subset=["datetime"])
+              # Rikiuojam ir šalinam dublikatus
+              df = df.sort_values("datetime")
+              if "datetime" in df.columns:
+                  df = df.drop_duplicates(subset=["datetime"])
               return df
 
           def build_labels(df, horizon, thr):
@@ -159,7 +169,7 @@ jobs:
                       print(f"⚠️ {tkr}: per mažai eilučių ({len(data)}). Praleidžiu.")
                       continue
 
-                  # padalijimas train/test (paskutinė diena į testą, jei pakanka)
+                  # Train/test – paskutinė diena į testą (jei pakanka)
                   if len(data) < 1000:
                       split = int(len(data)*0.8)
                   else:

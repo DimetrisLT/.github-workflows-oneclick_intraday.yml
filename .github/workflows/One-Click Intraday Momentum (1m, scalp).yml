@@ -1,61 +1,283 @@
-import numpy as np, pandas as pd
+name: One-Click Intraday Momentum (1m, scalp)
 
-def rsi(series, n=14):
-    d = series.diff()
-    up = np.where(d > 0, d, 0.0)
-    dn = np.where(d < 0, -d, 0.0)
-    up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
-    dn = pd.Series(dn, index=series.index).ewm(alpha=1/n, adjust=False).mean()
-    rs = up / dn.replace(0, np.nan)
-    return 100 - (100/(1+rs))
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:   { description: "Tickers (comma-separated)", default: "OPEN,PLTR" }
+      period:    { description: "yfinance period (1m~7d max)", default: "7d" }
+      interval:  { description: "Bar interval", default: "1m" }
+      horizon:   { description: "Prognozės horizontas minutėmis", default: "15" }
+      thr:       { description: "Judėjimo slenkstis (0.005=0.5%)", default: "0.005" }
+      prob_th:   { description: "Min. tikimybė signalui (0..1)", default: "0.55" }
+  schedule:
+    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC); įtraukiamas premarket
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_f = series.ewm(span=fast, adjust=False).mean()
-    ema_s = series.ewm(span=slow, adjust=False).mean()
-    m = ema_f - ema_s
-    s = m.ewm(span=signal, adjust=False).mean()
-    return m, s, m - s
+jobs:
+  intraday:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
-def vwap(df):
-    tp = (df["high"] + df["low"] + df["close"]) / 3.0
-    return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
+      - name: Create project files
+        run: |
+          mkdir -p src out
 
-def obv(df):
-    r = df["close"].pct_change().fillna(0.0)
-    return (np.sign(r) * df["volume"]).cumsum()
+          cat > requirements.txt << 'REQ'
+          pandas>=2.0
+          numpy>=1.23
+          yfinance>=0.2.40
+          scikit-learn>=1.3
+          matplotlib>=3.7
+          scipy>=1.10
+          tqdm>=4.66
+          REQ
 
-def feature_table(df: pd.DataFrame) -> pd.DataFrame:
-    X = df.copy()
+          cat > src/indicators_intraday.py << 'PY'
+          import numpy as np, pandas as pd
 
-    # užtikrinam, kad baziniai stulpeliai yra Series(float)
-    for c in ["open","high","low","close","volume"]:
-        if c in X.columns:
-            X[c] = pd.to_numeric(X[c], errors="coerce")
+          def rsi(series, n=14):
+              d = series.diff()
+              up = np.where(d > 0, d, 0.0)
+              dn = np.where(d < 0, -d, 0.0)
+              up = pd.Series(up, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+              dn = pd.Series(dn, index=series.index).ewm(alpha=1/n, adjust=False).mean()
+              rs = up / dn.replace(0, np.nan)
+              return 100 - (100/(1+rs))
 
-    close  = X["close"]
-    volume = X["volume"]
+          def macd(series, fast=12, slow=26, signal=9):
+              ema_f = series.ewm(span=fast, adjust=False).mean()
+              ema_s = series.ewm(span=slow, adjust=False).mean()
+              m = ema_f - ema_s
+              s = m.ewm(span=signal, adjust=False).mean()
+              return m, s, m - s
 
-    X["ret1"]    = close.pct_change().fillna(0.0)
-    X["rvol20"]  = volume / volume.rolling(20).mean()
-    X["hl_range"]= (X["high"] - X["low"]) / close.shift()
+          def vwap(df):
+              tp = (df["high"] + df["low"] + df["close"]) / 3.0
+              return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
 
-    # VWAP / OBV
-    X["vwap"] = vwap(X)
-    X["obv"]  = obv(X)
+          def obv(df):
+              r = df["close"].pct_change().fillna(0.0)
+              return (np.sign(r) * df["volume"]).cumsum()
 
-    # EMA ir santykis – viskas iš Series, kad nebūtų daugiastulpelių
-    ema5  = close.ewm(span=5, adjust=False).mean()
-    ema20 = close.ewm(span=20, adjust=False).mean()
-    X["ema5"]  = ema5
-    X["ema20"] = ema20
-    X["ema_ratio"] = (close - ema5) / ema20
+          def feature_table(df: pd.DataFrame) -> pd.DataFrame:
+              X = df.copy()
 
-    # RSI / MACD
-    X["rsi14"] = rsi(close, 14)
-    m, s, h = macd(close, 12, 26, 9)
-    X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
+              # užtikrinam, kad baziniai stulpeliai yra Series(float)
+              for c in ["open","high","low","close","volume"]:
+                  if c in X.columns:
+                      X[c] = pd.to_numeric(X[c], errors="coerce")
 
-    # Trumpalaikė volatilumas
-    X["vola20"] = X["ret1"].rolling(20).std()
+              close  = X["close"]
+              volume = X["volume"]
 
-    return X
+              X["ret1"]     = close.pct_change().fillna(0.0)
+              X["rvol20"]   = volume / volume.rolling(20).mean()
+              X["hl_range"] = (X["high"] - X["low"]) / close.shift()
+
+              # VWAP / OBV
+              X["vwap"] = vwap(X)
+              X["obv"]  = obv(X)
+
+              # EMA ir santykis – viskas iš Series (vienas stulpelis)
+              ema5  = close.ewm(span=5, adjust=False).mean()
+              ema20 = close.ewm(span=20, adjust=False).mean()
+              X["ema5"]      = ema5
+              X["ema20"]     = ema20
+              X["ema_ratio"] = (close - ema5) / ema20
+
+              # RSI / MACD
+              X["rsi14"] = rsi(close, 14)
+              m, s, h = macd(close, 12, 26, 9)
+              X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
+
+              # Trumpalaikė volatilumas
+              X["vola20"] = X["ret1"].rolling(20).std()
+
+              return X
+          PY
+
+          cat > train_intraday.py << 'PY'
+          import argparse, os, warnings, numpy as np, pandas as pd, yfinance as yf
+          from sklearn.preprocessing import StandardScaler
+          from sklearn.ensemble import HistGradientBoostingClassifier
+          from sklearn.metrics import classification_report, confusion_matrix
+          import matplotlib.pyplot as plt
+          from src.indicators_intraday import feature_table
+
+          warnings.filterwarnings("ignore")
+
+          def _force_datetime(df: pd.DataFrame) -> pd.DataFrame:
+              df = pd.DataFrame(df).reset_index()
+              cands = [c for c in df.columns
+                       if str(c).lower() in ("datetime","date","time","timestamp")]
+              if not cands:
+                  cands = ["index"] if "index" in df.columns else [df.columns[0]]
+              dtcol = cands[0]
+              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce", utc=True)
+              df = df[df["datetime"].notna()]
+              return df
+
+          def dl(ticker, period, interval):
+              df = yf.download(ticker, period=period, interval=interval,
+                               auto_adjust=True, prepost=True, progress=False)
+              if df is None or len(df)==0:
+                  return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
+
+              df = _force_datetime(df)
+
+              if "datetime" not in df.columns:
+                  tmp = df.reset_index()
+                  src = "index" if "index" in tmp.columns else tmp.columns[0]
+                  tmp["datetime"] = pd.to_datetime(tmp[src], errors="coerce", utc=True)
+                  df = tmp[tmp["datetime"].notna()]
+
+              price_cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
+              df = df[["datetime"] + price_cols].rename(columns=str.lower)
+
+              # --- SAUGIKLIAI NUO DUBLIKATŲ / TIPŲ ---
+              df = df.loc[:, ~df.columns.duplicated()]
+              for c in ["open","high","low","close","volume"]:
+                  if c in df.columns:
+                      df[c] = pd.to_numeric(df[c], errors="coerce")
+              # ---------------------------------------
+
+              df = df.sort_values("datetime")
+              df = df.drop_duplicates()  # be subset – nebekris KeyError
+
+              return df
+
+          def build_labels(df, horizon, thr):
+              y_fwd = df["close"].shift(-horizon)/df["close"] - 1.0
+              label = np.where(y_fwd >= thr, 1, np.where(y_fwd <= -thr, -1, 0))
+              return y_fwd, label
+
+          def main(args):
+              os.makedirs("out", exist_ok=True)
+              tickers=[t.strip().upper() for t in args.tickers.split(",")]
+              horizon=int(args.horizon); thr=float(args.thr); prob_th=float(args.prob_th)
+
+              summary=[]
+              for tkr in tickers:
+                  print(f"=== {tkr} | {args.interval} | period={args.period} | horizon={horizon}min | thr={thr}")
+                  raw = dl(tkr, args.period, args.interval)
+                  if raw.empty:
+                      print(f"⚠️ {tkr}: tušti duomenys, praleidžiu.")
+                      continue
+
+                  feats = feature_table(raw)
+                  y_fwd, label = build_labels(feats, horizon, thr)
+                  data = feats.copy()
+                  data["y_fwd"] = y_fwd
+                  data["label"] = label
+                  data = data.dropna().reset_index(drop=True)
+
+                  if len(data) < 200:
+                      print(f"⚠️ {tkr}: per mažai eilučių ({len(data)}). Praleidžiu.")
+                      continue
+
+                  if len(data) < 1000:
+                      split = int(len(data)*0.8)
+                  else:
+                      last = data["datetime"].dt.date.iloc[-1]
+                      prev = data[data["datetime"].dt.date < last]
+                      split = len(prev) if len(prev)>400 else int(len(data)*0.85)
+                  tr = data.iloc[:split].copy()
+                  te = data.iloc[split:].copy()
+
+                  feat_cols = [c for c in feats.columns if c!="datetime"]
+                  scaler = StandardScaler()
+                  Xtr = scaler.fit_transform(tr[feat_cols])
+                  Xte = scaler.transform(te[feat_cols])
+
+                  clf = HistGradientBoostingClassifier(max_depth=6, learning_rate=0.07,
+                                                       l2_regularization=0.0, max_iter=300)
+                  clf.fit(Xtr, tr["label"])
+                  proba = clf.predict_proba(Xte)
+                  classes = clf.classes_
+                  idx_up = list(classes).index(1) if 1 in classes else None
+                  idx_dn = list(classes).index(-1) if -1 in classes else None
+                  ypred = clf.predict(Xte)
+
+                  te["pred_label"] = ypred
+                  te["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
+                  te["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
+                  te["signal"] = "HOLD"
+                  te.loc[(te["pred_label"]==1) & (te["prob_up"]>=prob_th),  "signal"] = "BUY"
+                  te.loc[(te["pred_label"]==-1) & (te["prob_dn"]>=prob_th), "signal"] = "SELL"
+
+                  rep = classification_report(te["label"], te["pred_label"], output_dict=True, zero_division=0)
+                  cm  = confusion_matrix(te["label"], te["pred_label"], labels=[-1,0,1])
+                  acc_all = rep["accuracy"]
+                  active = te[te["signal"]!="HOLD"]
+                  acc_act = (active["label"]==active["pred_label"]).mean() if len(active)>0 else np.nan
+
+                  print(f"{tkr} accuracy(all)={acc_all:.3f}, accuracy(active)={acc_act:.3f}")
+                  print("Confusion matrix [-1,0,1]:", cm)
+
+                  out = te[["datetime","close","label","y_fwd","pred_label","prob_up","prob_dn","signal"]].copy()
+                  out.to_csv(f"out/preds_intraday_{tkr}.csv", index=False)
+
+                  dlast = out["datetime"].dt.date.iloc[-1]
+                  show = out[out["datetime"].dt.date==dlast].copy()
+
+                  import numpy as np
+                  plt.figure(figsize=(11,4), dpi=140)
+                  plt.plot(show["datetime"], show["y_fwd"], label=f"Realus {horizon}m pokytis")
+                  plt.plot(show["datetime"],
+                           np.where(show["pred_label"]==1,  thr,
+                                    np.where(show["pred_label"]==-1, -thr, 0.0)),
+                           label="Prognozuota (±thr)", alpha=0.8)
+                  plt.axhline(thr, ls="--", alpha=.4); plt.axhline(-thr, ls="--", alpha=.4); plt.axhline(0, ls=":", color="gray")
+                  for s,c in [("BUY","green"),("SELL","red")]:
+                      m = show[show["signal"]==s]
+                      plt.scatter(m["datetime"], np.zeros(len(m)), label=s, s=18, color=c)
+                  plt.title(f"{tkr} | acc(all)={acc_all:.2%} active={acc_act:.2%}")
+                  plt.legend(); plt.tight_layout()
+                  plt.savefig(f"out/intraday_{tkr}.png"); plt.close()
+
+                  summary.append([tkr, len(out), float(acc_all), float(acc_act), float(thr), float(prob_th)])
+
+              pd.DataFrame(summary, columns=["ticker","n_test","acc_all","acc_active","thr","prob_th"])\
+                .to_csv("out/summary_intraday.csv", index=False)
+
+          if __name__=="__main__":
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--tickers",  type=str, default="OPEN,PLTR")
+              ap.add_argument("--period",   type=str, default="7d")
+              ap.add_argument("--interval", type=str, default="1m")
+              ap.add_argument("--horizon",  type=str, default="15")
+              ap.add_argument("--thr",      type=str, default="0.005")
+              ap.add_argument("--prob_th",  type=str, default="0.55")
+              args = ap.parse_args()
+              main(args)
+          PY
+
+      - name: Install base deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Train intraday momentum
+        env:
+          TICKERS:  ${{ github.event.inputs.tickers }}
+          PERIOD:   ${{ github.event.inputs.period }}
+          INTERVAL: ${{ github.event.inputs.interval }}
+          HORIZON:  ${{ github.event.inputs.horizon }}
+          THR:      ${{ github.event.inputs.thr }}
+          PROBTH:   ${{ github.event.inputs.prob_th }}
+        run: |
+          : ${TICKERS:=OPEN,PLTR}
+          : ${PERIOD:=7d}
+          : ${INTERVAL:=1m}
+          : ${HORIZON:=15}
+          : ${THR:=0.005}
+          : ${PROBTH:=0.55}
+          python train_intraday.py --tickers "$TICKERS" --period "$PERIOD" --interval "$INTERVAL" --horizon "$HORIZON" --thr "$THR" --prob_th "$PROBTH"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: intraday_out
+          path: out

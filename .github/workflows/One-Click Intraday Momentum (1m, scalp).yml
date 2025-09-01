@@ -63,7 +63,6 @@ jobs:
 
           def feature_table(df: pd.DataFrame) -> pd.DataFrame:
               X = df.copy()
-              # bazinių kolonų tipai
               for c in ["open","high","low","close","volume"]:
                   if c in X.columns:
                       X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -102,14 +101,29 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
-          def _force_datetime(df: pd.DataFrame) -> pd.DataFrame:
-              df = pd.DataFrame(df).reset_index()
-              cands = [c for c in df.columns
-                       if str(c).lower() in ("datetime","date","time","timestamp")]
-              if not cands:
-                  cands = ["index"] if "index" in df.columns else [df.columns[0]]
-              dtcol = cands[0]
-              df["datetime"] = pd.to_datetime(df[dtcol], errors="coerce", utc=True)
+          def _flatten_cols(cols):
+              if isinstance(cols, pd.MultiIndex):
+                  return ["_".join([str(x) for x in tup if str(x)!=""]).strip() for tup in cols]
+              return [str(c) for c in cols]
+
+          def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+              # i) sutvarkom pavadinimus
+              df = pd.DataFrame(df)
+              df.columns = _flatten_cols(df.columns)
+              df.columns = [c.strip().lower() for c in df.columns]
+
+              # ii) įdedam datetime
+              if "datetime" not in df.columns:
+                  if isinstance(df.index, pd.DatetimeIndex):
+                      df = df.reset_index().rename(columns={"index":"datetime"})
+                  else:
+                      for cand in ["datetime","date","time","timestamp","datetimestamp"]:
+                          if cand in df.columns:
+                              df["datetime"] = pd.to_datetime(df[cand], errors="coerce", utc=True)
+                              break
+                      else:
+                          df["datetime"] = pd.to_datetime(df.index, errors="coerce", utc=True)
+
               df = df[df["datetime"].notna()]
               return df
 
@@ -119,16 +133,15 @@ jobs:
               if df is None or len(df)==0:
                   return pd.DataFrame(columns=["datetime","open","high","low","close","volume"])
 
-              df = _force_datetime(df)
+              df = _normalize_columns(df)
 
-              if "datetime" not in df.columns:
-                  tmp = df.reset_index()
-                  src = "index" if "index" in tmp.columns else tmp.columns[0]
-                  tmp["datetime"] = pd.to_datetime(tmp[src], errors="coerce", utc=True)
-                  df = tmp[tmp["datetime"].notna()]
+              # jei nėra 'close', bandome 'adj close'
+              if "close" not in df.columns and "adj close" in df.columns:
+                  df["close"] = df["adj close"]
 
-              price_cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-              df = df[["datetime"] + price_cols].rename(columns=str.lower)
+              # renkamės tik reikalingas kolonas
+              keep = ["datetime"] + [c for c in ["open","high","low","close","volume"] if c in df.columns]
+              df = df[keep]
 
               # --- SAUGIKLIAI NUO DUBLIKATŲ / TIPŲ ---
               df.columns = df.columns.map(str)
@@ -145,7 +158,7 @@ jobs:
               # ---------------------------------------
 
               df = df.sort_values("datetime")
-              df = df.drop_duplicates()  # be subset – saugu
+              df = df.drop_duplicates()   # be subset – saugu
 
               return df
 

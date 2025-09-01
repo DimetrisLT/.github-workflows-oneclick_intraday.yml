@@ -1,3 +1,5 @@
+on:
+  workflow_dispatch:
 import argparse, os, warnings
 import numpy as np, pandas as pd, yfinance as yf
 from sklearn.preprocessing import StandardScaler

@@ -122,24 +122,13 @@ jobs:
 
               # 3) saugi kainų/volume atranka (kas yra – tą imam)
               price_cols = [c for c in ["Open","High","Low","Close","Volume"] if c in df.columns]
-              keep = ["datetime"] + price_cols
-              keep = [c for c in keep if c in df.columns]
-              df = df[keep].rename(columns=str.lower)
+              df = df[["datetime"] + price_cols].rename(columns=str.lower)
 
-              # Jei netikėtai „datetime“ vėl dingo – atkurti dabar
-              if "datetime" not in df.columns:
-                  tmp = df.reset_index()
-                  src = "index" if "index" in tmp.columns else tmp.columns[0]
-                  tmp["datetime"] = pd.to_datetime(tmp[src], errors="coerce", utc=True)
-                  df = tmp[tmp["datetime"].notna()]
-                  if "open" not in df.columns and "Open" in tmp.columns:
-                      df = df.rename(columns=str.lower)
-
-              # 4) rikiavimas + dublikatai (be KeyError)
+              # 4) rikiavimas + dublikatai (tik jei tikrai turime 'datetime' stulpelį)
               df = df.sort_values("datetime")
-              try:
+              if "datetime" in df.columns:
                   df = df.drop_duplicates(subset=["datetime"])
-              except Exception:
+              else:
                   df = df.drop_duplicates()
 
               return df

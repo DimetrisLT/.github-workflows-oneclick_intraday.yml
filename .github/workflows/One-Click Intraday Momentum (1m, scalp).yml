@@ -10,7 +10,7 @@ on:
       thr:       { description: "Judėjimo slenkstis (0.005=0.5%)", default: "0.005" }
       prob_th:   { description: "Min. tikimybė signalui (0..1)", default: "0.55" }
   schedule:
-    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC); įtraukiamas premarket
+    - cron: "15 13 * * 1-5"   # ~15 min iki NYSE (UTC), įtraukia premarket
 
 jobs:
   intraday:
@@ -101,28 +101,34 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
+          # --- normalizatorius: VISADA sukurs 'datetime' stulpelį ---
           def _flatten_cols(cols):
               if isinstance(cols, pd.MultiIndex):
                   return ["_".join([str(x) for x in tup if str(x)!=""]).strip() for tup in cols]
               return [str(c) for c in cols]
 
           def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-              # i) sutvarkom pavadinimus
               df = pd.DataFrame(df)
               df.columns = _flatten_cols(df.columns)
-              df.columns = [c.strip().lower() for c in df.columns]
+              df.columns = [str(c).strip().lower() for c in df.columns]
 
-              # ii) įdedam datetime
               if "datetime" not in df.columns:
-                  if isinstance(df.index, pd.DatetimeIndex):
+                  alt = next((c for c in ("date","time","timestamp","datetimestamp") if c in df.columns), None)
+                  if alt is not None:
+                      df["datetime"] = pd.to_datetime(df[alt], errors="coerce", utc=True)
+                  elif isinstance(df.index, pd.DatetimeIndex):
                       df = df.reset_index().rename(columns={"index":"datetime"})
                   else:
-                      for cand in ["datetime","date","time","timestamp","datetimestamp"]:
-                          if cand in df.columns:
-                              df["datetime"] = pd.to_datetime(df[cand], errors="coerce", utc=True)
-                              break
-                      else:
+                      # paskutinis saugiklis: bandome index -> datetime; jei nepavyksta – pirmą stulpelį
+                      try:
                           df["datetime"] = pd.to_datetime(df.index, errors="coerce", utc=True)
+                      except Exception:
+                          df = df.reset_index()
+                          df["datetime"] = pd.to_datetime(df.iloc[:,0], errors="coerce", utc=True)
+
+              if "datetime" not in df.columns:
+                  df = df.reset_index().rename(columns={"index":"datetime"})
+                  df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
 
               df = df[df["datetime"].notna()]
               return df
@@ -135,30 +141,27 @@ jobs:
 
               df = _normalize_columns(df)
 
-              # jei nėra 'close', bandome 'adj close'
               if "close" not in df.columns and "adj close" in df.columns:
                   df["close"] = df["adj close"]
 
-              # renkamės tik reikalingas kolonas
               keep = ["datetime"] + [c for c in ["open","high","low","close","volume"] if c in df.columns]
               df = df[keep]
 
-              # --- SAUGIKLIAI NUO DUBLIKATŲ / TIPŲ ---
+              # tipai ir dublikatai
               df.columns = df.columns.map(str)
               df = df.loc[:, ~df.columns.duplicated()]
 
               def _to_num_safe(obj):
                   if isinstance(obj, pd.DataFrame):
-                      obj = obj.iloc[:, 0]
-                  return pd.to_numeric(getattr(obj, "squeeze", lambda: obj)(), errors="coerce")
+                      obj = obj.iloc[:,0]
+                  return pd.to_numeric(getattr(obj,"squeeze",lambda:obj)(), errors="coerce")
 
               for c in ["open","high","low","close","volume"]:
                   if c in df.columns:
                       df[c] = _to_num_safe(df[c])
-              # ---------------------------------------
 
               df = df.sort_values("datetime")
-              df = df.drop_duplicates()   # be subset – saugu
+              df = df.drop_duplicates()
 
               return df
 

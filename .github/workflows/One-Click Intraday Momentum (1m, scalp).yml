@@ -63,8 +63,7 @@ jobs:
 
           def feature_table(df: pd.DataFrame) -> pd.DataFrame:
               X = df.copy()
-
-              # užtikrinam, kad baziniai stulpeliai yra Series(float)
+              # bazinių kolonų tipai
               for c in ["open","high","low","close","volume"]:
                   if c in X.columns:
                       X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -76,25 +75,20 @@ jobs:
               X["rvol20"]   = volume / volume.rolling(20).mean()
               X["hl_range"] = (X["high"] - X["low"]) / close.shift()
 
-              # VWAP / OBV
               X["vwap"] = vwap(X)
               X["obv"]  = obv(X)
 
-              # EMA ir santykis – viskas iš Series (vienas stulpelis)
-              ema5  = close.ewm(span=5, adjust=False).mean()
+              ema5  = close.ewm(span=5,  adjust=False).mean()
               ema20 = close.ewm(span=20, adjust=False).mean()
               X["ema5"]      = ema5
               X["ema20"]     = ema20
               X["ema_ratio"] = (close - ema5) / ema20
 
-              # RSI / MACD
               X["rsi14"] = rsi(close, 14)
               m, s, h = macd(close, 12, 26, 9)
               X["macd"] = m; X["macd_sig"] = s; X["macd_hist"] = h
 
-              # Trumpalaikė volatilumas
               X["vola20"] = X["ret1"].rolling(20).std()
-
               return X
           PY
 
@@ -137,14 +131,21 @@ jobs:
               df = df[["datetime"] + price_cols].rename(columns=str.lower)
 
               # --- SAUGIKLIAI NUO DUBLIKATŲ / TIPŲ ---
+              df.columns = df.columns.map(str)
               df = df.loc[:, ~df.columns.duplicated()]
+
+              def _to_num_safe(obj):
+                  if isinstance(obj, pd.DataFrame):
+                      obj = obj.iloc[:, 0]
+                  return pd.to_numeric(getattr(obj, "squeeze", lambda: obj)(), errors="coerce")
+
               for c in ["open","high","low","close","volume"]:
                   if c in df.columns:
-                      df[c] = pd.to_numeric(df[c], errors="coerce")
+                      df[c] = _to_num_safe(df[c])
               # ---------------------------------------
 
               df = df.sort_values("datetime")
-              df = df.drop_duplicates()  # be subset – nebekris KeyError
+              df = df.drop_duplicates()  # be subset – saugu
 
               return df
 
@@ -204,7 +205,7 @@ jobs:
                   te["prob_up"] = proba[:,idx_up] if idx_up is not None else 0.0
                   te["prob_dn"] = proba[:,idx_dn] if idx_dn is not None else 0.0
                   te["signal"] = "HOLD"
-                  te.loc[(te["pred_label"]==1) & (te["prob_up"]>=prob_th),  "signal"] = "BUY"
+                  te.loc[(te["pred_label"]==1)  & (te["prob_up"]>=prob_th),  "signal"] = "BUY"
                   te.loc[(te["pred_label"]==-1) & (te["prob_dn"]>=prob_th), "signal"] = "SELL"
 
                   rep = classification_report(te["label"], te["pred_label"], output_dict=True, zero_division=0)
